@@ -1,0 +1,115 @@
+name: Build VLine Practice Tools
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate project source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source_file='src/client/java/com/vlineaim/training/VLineTrainingClient.java'
+          project_ready() {
+            local root="$1"
+            [[ -f "$root/build.gradle" \
+              && -f "$root/settings.gradle" \
+              && -f "$root/src/main/resources/fabric.mod.json" \
+              && -f "$root/$source_file" ]]
+          }
+
+          if project_ready "."; then
+            echo "Complete VLine Practice Tools source found in repository root."
+          else
+            echo "Root Gradle files alone are not enough; looking for the actual VLine source ZIP."
+            archive=""
+            shopt -s nullglob
+            for candidate in ./*.zip; do
+              entries="$(unzip -Z1 "$candidate" 2>/dev/null || true)"
+              if grep -Eq '(^|/)build\.gradle$' <<< "$entries" \
+                && grep -Eq '(^|/)settings\.gradle$' <<< "$entries" \
+                && grep -Eq '(^|/)src/main/resources/fabric\.mod\.json$' <<< "$entries" \
+                && grep -Eq '(^|/)src/client/java/com/vlineaim/training/VLineTrainingClient\.java$' <<< "$entries"; then
+                archive="$candidate"
+                break
+              fi
+            done
+
+            if [[ -z "$archive" ]]; then
+              echo "::error::Could not find a complete VLine Practice Tools project. The repository must contain build.gradle, settings.gradle, src/main/resources/fabric.mod.json, and src/client/java/com/vlineaim/training/VLineTrainingClient.java, either at the root or inside the source ZIP."
+              echo "Repository files:"
+              find . -maxdepth 4 -type f -not -path './.git/*' -print | sort || true
+              exit 1
+            fi
+
+            echo "Extracting source from $archive"
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT
+            unzip -q "$archive" -d "$tmp"
+            extracted_source="$(find "$tmp" -type f -path '*/src/client/java/com/vlineaim/training/VLineTrainingClient.java' -print -quit)"
+            if [[ -z "$extracted_source" ]]; then
+              echo "::error::The ZIP contains a matching listing but the client source could not be extracted."
+              exit 1
+            fi
+            project_root="${extracted_source%/src/client/java/com/vlineaim/training/VLineTrainingClient.java}"
+            if ! project_ready "$project_root"; then
+              echo "::error::The extracted ZIP does not contain all required project files."
+              find "$tmp" -maxdepth 5 -type f -print | sort || true
+              exit 1
+            fi
+            cp -a "$project_root"/. ./
+            rm -rf "$tmp"
+            trap - EXIT
+          fi
+
+          if ! project_ready "."; then
+            echo "::error::VLine project validation failed after source preparation."
+            exit 1
+          fi
+          echo "Verified build.gradle, settings.gradle, fabric.mod.json, and VLineTrainingClient.java."
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.7.1'
+
+      - name: Build mod
+        run: gradle --no-daemon --no-configuration-cache clean build
+
+      - name: Show distributable JARs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t jars < <(find build/libs -maxdepth 1 -type f -name '*.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-dev.jar' -print | sort)
+          if [[ ${#jars[@]} -eq 0 ]]; then
+            echo "::error::No distributable mod JAR was created in build/libs/."
+            find build/libs -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+          printf 'Built mod JAR: %s\n' "${jars[@]}"
+
+      - name: Upload mod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vline-practice-tools-minecraft-26.1.2
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
